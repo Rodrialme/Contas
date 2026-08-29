@@ -290,6 +290,7 @@ svg text.rot{font-family:var(--corpo);font-size:11px;fill:var(--tinta-2)}
       <section class="view" id="v-orcamentos"></section>
       <section class="view" id="v-dividas"></section>
       <section class="view" id="v-objetivos"></section>
+      <section class="view" id="v-contratos"></section>
       <section class="view" id="v-definicoes"></section>
     </div>
   </main>
@@ -324,7 +325,7 @@ const mesDe = d => (d||'').slice(0,7);
 const tituloMes = m => { const [a,b] = m.split('-'); return MESES[+b-1] + ' ' + a; };
 const somaMes = (m, k) => { const [a,b] = m.split('-').map(Number); const d = new Date(a, b-1+k, 1); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0'); };
 
-let S = { transacoes:[], orcamentos:{}, dividas:[], objetivos:[], config:{saldoInicial:0} };
+let S = { transacoes:[], orcamentos:{}, dividas:[], objetivos:[], contratos:[], config:{saldoInicial:0} };
 let mes = mesDe(hoje());
 let vista = 'resumo';
 let filtros = { tipo:'todos', categoria:'todas', texto:'', ambito:'mes' };
@@ -759,8 +760,295 @@ function pintarDefinicoes(){
         <li><b>Orçamentos</b> — limites mensais por categoria, com aviso quando passa.</li>
         <li><b>Dívidas</b> — cada crédito, os juros que custa e a ordem por onde vale a pena atacar.</li>
         <li><b>Objetivos</b> — metas de poupança e a previsão de quando lá chega.</li>
+        <li><b>Contratos</b> — cole o texto de um contrato e a ferramenta assinala cláusulas em falta ou de risco.</li>
       </ul>
     </div>`;
+}
+
+/* ======================= analisador de contratos ======================= */
+let textoContratoAtual = '';
+let nomeContratoAtual = '';
+let analiseAtual = null;
+
+const semAcento = s => String(s||'').normalize('NFD').replace(/[̀-ͯ]/g,'').toLowerCase();
+
+function trechoContexto(original, indice, comprimento){
+  const inicio = Math.max(0, indice - 45), fim = Math.min(original.length, indice + comprimento + 45);
+  return (inicio > 0 ? '…' : '') + original.slice(inicio, fim).replace(/\s+/g,' ').trim() + (fim < original.length ? '…' : '');
+}
+function primeiraOcorrencia(norm, original, regex){
+  const m = regex.exec(norm);
+  return m ? trechoContexto(original, m.index, m[0].length) : null;
+}
+
+const REGRAS_CONTRATO = [
+  { id:'sem-prazo', minLen:400, tipo:'ausencia', gravidade:'moderada',
+    padrao:/vigenc|duracao do (presente )?contrato|prazo do (presente )?contrato|produz efeitos a partir/,
+    titulo:'Não encontrámos um prazo ou vigência definidos',
+    explicacao:'Não foi detetada nenhuma referência clara à duração ou vigência do contrato.',
+    sugestao:'Confirme se existe uma cláusula que defina claramente a data de início, a duração e as condições de renovação.' },
+  { id:'sem-rescisao', minLen:400, tipo:'ausencia', gravidade:'grave',
+    padrao:/rescis|resolucao do contrato|denuncia do contrato|cessacao do contrato|termo do contrato/,
+    titulo:'Não encontrámos uma cláusula de rescisão ou resolução',
+    explicacao:'Um contrato sem forma clara de terminar pode prendê-lo a obrigações sem saída definida.',
+    sugestao:'Peça que se acrescente uma cláusula que diga como e quando qualquer uma das partes pode terminar o contrato.' },
+  { id:'sem-lei-foro', minLen:400, tipo:'ausencia', gravidade:'atencao',
+    padrao:/lei aplicavel|foro competente|tribunal competente|jurisdicao/,
+    titulo:'Não encontrámos lei aplicável nem foro competente',
+    explicacao:'Sem esta cláusula, pode não ficar claro que tribunal resolveria um eventual litígio.',
+    sugestao:'Verifique se o contrato indica a lei aplicável e o tribunal competente em caso de conflito.' },
+  { id:'sem-protecao-dados', minLen:300, tipo:'condicional', gravidade:'moderada',
+    testar: norm => /dados pessoais|dados do cliente|dados do titular/.test(norm) && !/rgpd|protecao de dados|regulamento geral (sobre|de) protecao de dados/.test(norm),
+    titulo:'Menciona dados pessoais mas não RGPD/proteção de dados',
+    explicacao:'O texto refere-se a dados pessoais mas não encontrámos nenhuma cláusula sobre proteção de dados ou RGPD.',
+    sugestao:'Confirme como os dados pessoais são tratados, guardados e partilhados, e se cumpre o RGPD.' },
+  { id:'sem-assinatura', minLen:400, tipo:'ausencia', gravidade:'atencao',
+    padrao:/assinatura|assinado|assinam o presente|outorgantes assinam/,
+    titulo:'Não encontrámos referência a assinatura',
+    explicacao:'Pode ser normal se colou apenas um excerto, mas confirme que a versão final tem espaço para assinatura e data de ambas as partes.',
+    sugestao:'Confirme que o documento final identifica claramente quem assina e em que data.' },
+  { id:'renovacao-sem-aviso', tipo:'condicional', gravidade:'grave',
+    testar: norm => /renovacao automatica/.test(norm) && !/aviso previo|dias de antecedencia|pre-aviso/.test(norm),
+    regexTrecho:/renovacao automatica/,
+    titulo:'Renovação automática sem prazo de aviso prévio claro',
+    explicacao:'O contrato prevê renovação automática, mas não encontrámos um prazo definido para comunicar que não quer renovar.',
+    sugestao:'Peça que se defina um número concreto de dias de aviso prévio para não renovar, e anote essa data.' },
+  { id:'alteracao-unilateral', tipo:'presenca', gravidade:'grave',
+    padrao:/reserva-se o direito de (alterar|modificar)|altera(r|coes?)[^.]{0,100}unilateral|a qualquer momento e sem aviso previo/,
+    titulo:'Possibilidade de alteração unilateral das condições',
+    explicacao:'Foi encontrada uma cláusula que permite a uma das partes alterar as condições sem necessitar do acordo da outra.',
+    sugestao:'Peça que qualquer alteração dependa de acordo escrito de ambas as partes, ou pelo menos de um aviso prévio razoável.' },
+  { id:'exclusao-responsabilidade', tipo:'presenca', gravidade:'grave',
+    padrao:/nao se responsabiliza por quaisquer|exclusao (total )?de responsabilidade|sem qualquer responsabilidade por|isento de qualquer responsabilidade/,
+    titulo:'Exclusão ampla de responsabilidade',
+    explicacao:'Foi encontrada uma cláusula que isenta uma das partes de responsabilidade de forma muito abrangente.',
+    sugestao:'Verifique se a exclusão de responsabilidade não cobre também danos causados por negligência ou incumprimento grave — isso é normalmente inválido.' },
+  { id:'criterio-exclusivo', tipo:'presenca', gravidade:'grave',
+    padrao:/(ao |a )?exclusivo criterio d[ae]|criterio exclusivo d[ae]/,
+    titulo:'Decisões ao critério exclusivo de uma das partes',
+    explicacao:'O texto dá a uma das partes o poder de decidir sozinha sobre algo relevante do contrato, sem critérios objetivos.',
+    sugestao:'Peça que se definam critérios objetivos, em vez de deixar a decisão inteiramente a cargo de uma das partes.' },
+  { id:'renuncia-direitos', tipo:'presenca', gravidade:'grave',
+    padrao:/renuncia(m)? (expressamente )?a (todos os )?direitos|renuncia ao direito de/,
+    titulo:'Renúncia a direitos',
+    explicacao:'Foi encontrada uma cláusula em que uma das partes renuncia a direitos, o que pode ser abusivo consoante o contexto.',
+    sugestao:'Confirme exatamente a que direitos está a renunciar e se essa renúncia é legalmente válida.' },
+  { id:'aceitacao-tacita', tipo:'presenca', gravidade:'moderada',
+    padrao:/considera-se aceite|silencio (das partes |do cliente )?(vale|equivale) como aceitacao|falta de resposta[^.]{0,60}(sera|será) considerada/,
+    titulo:'Aceitação tácita por silêncio',
+    explicacao:'O contrato considera que o silêncio ou a falta de resposta equivale a aceitar novas condições.',
+    sugestao:'Prefira que qualquer alteração exija a sua aceitação expressa, não apenas a ausência de resposta.' },
+  { id:'nao-concorrencia-sem-limites', tipo:'condicional', gravidade:'grave',
+    testar: norm => /nao concorrencia|nao concorrer|clausula de nao concorrencia/.test(norm) && !/\d+\s*(dias|meses|anos)/.test(norm),
+    regexTrecho:/nao concorrencia|nao concorrer/,
+    titulo:'Cláusula de não concorrência sem limite de tempo definido',
+    explicacao:'Existe uma cláusula de não concorrência, mas não foi encontrado um período de tempo concreto que a limite.',
+    sugestao:'Peça que se defina um prazo e uma área geográfica concretos — cláusulas sem limites são mais restritivas e mais fáceis de contestar depois.' },
+  { id:'multa-desproporcionada', tipo:'presenca', gravidade:'grave',
+    padrao:/(multa|clausula penal)[^.]{0,80}(totalidade do contrato|valor total do contrato|integralidade do valor)/,
+    titulo:'Penalização ligada à totalidade do valor do contrato',
+    explicacao:'A multa ou cláusula penal parece estar associada ao valor total do contrato, o que pode ser desproporcionado.',
+    sugestao:'Compare o valor da penalização com o dano que efetivamente causaria incumprir — cláusulas penais muito desproporcionadas podem ser reduzidas judicialmente.' },
+  { id:'campos-por-preencher', tipo:'presenca', gravidade:'grave',
+    padrao:/_{4,}|a definir posteriormente|\[\s*(a definir|a preencher|completar)\s*\]/,
+    titulo:'Existem campos por preencher',
+    explicacao:'O texto contém espaços em branco ou marcadores como "a definir" que ainda não foram completados.',
+    sugestao:'Não assine sem que todos os campos estejam preenchidos e confirmados por escrito.' },
+  { id:'linguagem-vaga', tipo:'contagem', gravidade:'atencao', minimo:3,
+    padrao:/sempre que necessario|na medida do possivel|esforcos razoaveis|quando (aplicavel|adequado)/g,
+    titulo:'Linguagem vaga usada com frequência',
+    explicacao:'Expressões como "sempre que necessário" ou "esforços razoáveis" aparecem várias vezes, o que pode dificultar exigir o cumprimento exato de obrigações.',
+    sugestao:'Peça que se substituam expressões vagas por prazos, quantidades ou critérios concretos.' },
+];
+
+function detetarJurosMora(norm, original){
+  const re = /juros de mora[^.]{0,60}?(\d{1,2}(?:,\d+)?)\s?%/;
+  const m = re.exec(norm);
+  if (!m) return null;
+  const valor = parseFloat(m[1].replace(',','.'));
+  const depois = norm.slice(m.index + m[0].length, m.index + m[0].length + 20);
+  const porDia = /\bdia\b/.test(depois);
+  const porMes = !porDia && /\bmes\b/.test(depois);
+  const periodo = porDia ? ' ao dia' : porMes ? ' ao mês' : '';
+  const grave = porDia || (porMes && valor > 4);
+  return {
+    id:'juros-mora', titulo:'Verifique a taxa de juros de mora',
+    explicacao: grave
+      ? `Encontrámos uma taxa de juros de mora de ${m[1]}%${periodo}, que parece elevada e pode ultrapassar os limites legais.`
+      : `Encontrámos uma cláusula de juros de mora (${m[1]}%${periodo}). Vale a pena confirmar se respeita os limites legais aplicáveis.`,
+    sugestao:'Compare a taxa com os limites legais de juros de mora em vigor e confirme se não é uma penalização camuflada.',
+    gravidade: grave ? 'grave' : 'atencao',
+    trecho: trechoContexto(original, m.index, m[0].length)
+  };
+}
+function detetarPreAvisoCurto(norm, original){
+  const re = /(aviso previo|pre-aviso)[^.]{0,20}(\d{1,3})\s*(hora|horas)/;
+  const m = re.exec(norm);
+  if (!m) return null;
+  const horas = parseInt(m[2],10);
+  if (horas > 72) return null;
+  return {
+    id:'pre-aviso-curto', titulo:'Prazo de pré-aviso muito curto',
+    explicacao:`O prazo de aviso prévio encontrado é de apenas ${horas} horas, o que pode não dar tempo suficiente para reagir.`,
+    sugestao:'Peça um prazo de aviso prévio mais alargado, tipicamente contado em dias e não em horas.',
+    gravidade:'moderada',
+    trecho: trechoContexto(original, m.index, m[0].length)
+  };
+}
+
+function analisarTexto(textoOriginal){
+  const norm = semAcento(textoOriginal);
+  const achados = [];
+
+  REGRAS_CONTRATO.forEach(r => {
+    if (r.minLen && textoOriginal.trim().length < r.minLen) return;
+    if (r.tipo === 'ausencia'){
+      if (!r.padrao.test(norm)) achados.push({ id:r.id, titulo:r.titulo, explicacao:r.explicacao, sugestao:r.sugestao, gravidade:r.gravidade, trecho:null });
+    } else if (r.tipo === 'presenca'){
+      const t = primeiraOcorrencia(norm, textoOriginal, new RegExp(r.padrao.source,'i'));
+      if (t) achados.push({ id:r.id, titulo:r.titulo, explicacao:r.explicacao, sugestao:r.sugestao, gravidade:r.gravidade, trecho:t });
+    } else if (r.tipo === 'condicional'){
+      if (r.testar(norm)){
+        const t = r.regexTrecho ? primeiraOcorrencia(norm, textoOriginal, new RegExp(r.regexTrecho.source,'i')) : null;
+        achados.push({ id:r.id, titulo:r.titulo, explicacao:r.explicacao, sugestao:r.sugestao, gravidade:r.gravidade, trecho:t });
+      }
+    } else if (r.tipo === 'contagem'){
+      const m = norm.match(r.padrao);
+      if (m && m.length >= (r.minimo||2)) achados.push({ id:r.id, titulo:r.titulo, explicacao:r.explicacao + ` (encontrado ${m.length} vezes)`, sugestao:r.sugestao, gravidade:r.gravidade, trecho:null });
+    }
+  });
+
+  const jm = detetarJurosMora(norm, textoOriginal); if (jm) achados.push(jm);
+  const pa = detetarPreAvisoCurto(norm, textoOriginal); if (pa) achados.push(pa);
+
+  const contagens = { grave:0, moderada:0, atencao:0 };
+  achados.forEach(a => contagens[a.gravidade]++);
+  const pontuacao = Math.max(0, 100 - contagens.grave*15 - contagens.moderada*8 - contagens.atencao*3);
+  const nivel = pontuacao >= 80 ? 'baixo' : pontuacao >= 50 ? 'moderado' : 'elevado';
+  const ordem = { grave:0, moderada:1, atencao:2 };
+  achados.sort((a,b) => ordem[a.gravidade]-ordem[b.gravidade]);
+
+  return { pontuacao, nivel, contagens, achados, data:new Date().toISOString() };
+}
+
+function etiquetaGravidade(g){
+  const mapa = { grave:['vermelha','Grave'], moderada:['ocre','Moderada'], atencao:['cinza','A rever'] };
+  const [c,t] = mapa[g] || mapa.atencao;
+  return `<span class="etiq ${c}">${t}</span>`;
+}
+function etiquetaNivel(n){
+  const mapa = { elevado:['vermelha','Risco elevado'], moderado:['ocre','Risco moderado'], baixo:['verde','Risco baixo'] };
+  const [c,t] = mapa[n] || mapa.moderado;
+  return `<span class="etiq ${c}">${t}</span>`;
+}
+
+function cartaoResultadoAnalise(a){
+  const cor = a.nivel === 'elevado' ? 'vermelho' : a.nivel === 'moderado' ? 'ocre' : 'verde';
+  return `
+    <div class="cartao" style="border-color:var(--${cor})">
+      <h3 style="color:var(--${cor})">Resultado da análise <em>${a.achados.length} sinal${a.achados.length===1?'':'is'} encontrado${a.achados.length===1?'':'s'}</em></h3>
+      <div class="grelha g4" style="margin-bottom:16px">
+        <div class="kpi"><small>Pontuação</small><strong class="num">${a.pontuacao}/100</strong><span>${etiquetaNivel(a.nivel)}</span></div>
+        <div class="kpi"><small>Graves</small><strong class="num neg">${a.contagens.grave}</strong><span>a corrigir antes de assinar</span></div>
+        <div class="kpi"><small>Moderadas</small><strong class="num aviso">${a.contagens.moderada}</strong><span>vale a pena questionar</span></div>
+        <div class="kpi"><small>A rever</small><strong class="num">${a.contagens.atencao}</strong><span>confirmar por si</span></div>
+      </div>
+      ${a.achados.length ? a.achados.map(f => `
+        <div class="item-prog">
+          <header><b>${esc(f.titulo)}</b>${etiquetaGravidade(f.gravidade)}</header>
+          <p style="font-size:13px;color:var(--tinta-2);margin:4px 0 6px">${esc(f.explicacao)}</p>
+          ${f.trecho ? `<p style="font-size:12.5px;font-family:var(--mono);background:var(--papel);border-radius:6px;padding:8px 10px;color:var(--tinta-2)">"${esc(f.trecho)}"</p>` : ''}
+          <p style="font-size:12.5px;color:var(--tinta-3);margin-top:6px"><b>Sugestão:</b> ${esc(f.sugestao)}</p>
+        </div>`).join('') : `<div class="vazio"><b>Nenhum sinal de alerta encontrado</b><p>As regras verificadas não detetaram os padrões habituais de risco. Reveja mesmo assim os pontos essenciais à mão.</p></div>`}
+    </div>`;
+}
+
+function pintarContratos(){
+  const guardados = [...S.contratos].sort((a,b) => b.data.localeCompare(a.data));
+
+  document.getElementById('v-contratos').innerHTML = `
+    <div class="cartao">
+      <h3>Analisador de fraquezas contratuais <em>deteção automática de cláusulas de risco</em></h3>
+      <p style="font-size:13px;color:var(--tinta-2);margin-bottom:14px">
+        Cole o texto de um contrato (ou carregue um ficheiro .txt) e a ferramenta procura, neste dispositivo, sinais habituais
+        de cláusulas fracas, abusivas ou em falta. É uma primeira triagem automática — não substitui a leitura atenta nem o
+        parecer de um advogado em contratos importantes.
+      </p>
+      <label class="campo">Nome do contrato (para guardar, opcional)
+        <input type="text" id="in-contrato-nome" placeholder="Ex.: Contrato de arrendamento — Rua X" value="${esc(nomeContratoAtual)}" oninput="nomeContratoAtual=this.value"></label>
+      <label class="campo" style="margin-top:11px">Texto do contrato
+        <textarea id="in-contrato-texto" rows="12" placeholder="Cole aqui o texto integral do contrato…" style="font-family:var(--mono);font-size:13px;resize:vertical" oninput="textoContratoAtual=this.value">${esc(textoContratoAtual)}</textarea>
+      </label>
+      <div class="barra-acoes" style="margin-top:12px">
+        <button class="btn" onclick="analisarContratoAtual()">Analisar contrato</button>
+        <button class="btn claro" onclick="document.getElementById('ficheiro-contrato').click()">Carregar ficheiro .txt</button>
+        <input type="file" id="ficheiro-contrato" accept=".txt,text/plain" style="display:none" onchange="carregarFicheiroContrato(this)">
+        ${analiseAtual ? `<button class="btn claro" onclick="guardarAnaliseAtual()">Guardar esta análise</button>` : ''}
+      </div>
+    </div>
+
+    ${analiseAtual ? cartaoResultadoAnalise(analiseAtual) : ''}
+
+    <div class="cartao">
+      <h3>Contratos guardados</h3>
+      ${guardados.length ? guardados.map(c => `
+        <div class="item-prog">
+          <header><b>${esc(c.nome || 'Sem nome')}</b>${etiquetaNivel(c.nivel)}</header>
+          <footer><span>${new Date(c.data).toLocaleDateString('pt-PT')} · ${c.achados.length} sinal${c.achados.length===1?'':'is'} · pontuação ${c.pontuacao}/100</span>
+            <span style="white-space:nowrap">
+              <button class="btn claro pequeno" onclick="verContratoGuardado('${c.id}')">Ver</button>
+              <button class="btn claro pequeno" onclick="apagarContratoGuardado('${c.id}')">Apagar</button>
+            </span></footer>
+        </div>`).join('') : `<div class="vazio"><p>Ainda não guardou nenhuma análise.</p></div>`}
+    </div>
+
+    <div class="cartao">
+      <h3>Como interpretar</h3>
+      <p style="font-size:13.5px;color:var(--tinta-2);line-height:1.6">
+        As regras procuram padrões de texto comuns em contratos problemáticos — cláusulas em falta (prazo, rescisão, lei
+        aplicável), cláusulas de risco (renovação automática sem aviso, alterações unilaterais, exclusão de responsabilidade,
+        penalizações desproporcionadas) e linguagem ambígua. Um resultado "sem sinais" não significa que o contrato é seguro —
+        só que não correspondeu a nenhum dos padrões verificados. Tudo é processado neste dispositivo; o texto do contrato
+        nunca é enviado para nenhum servidor.
+      </p>
+    </div>`;
+}
+
+function analisarContratoAtual(){
+  const nomeEl = document.getElementById('in-contrato-nome');
+  const textoEl = document.getElementById('in-contrato-texto');
+  if (nomeEl) nomeContratoAtual = nomeEl.value;
+  if (textoEl) textoContratoAtual = textoEl.value;
+  if (textoContratoAtual.trim().length < 30){ aviso('Cole primeiro o texto do contrato'); return; }
+  analiseAtual = analisarTexto(textoContratoAtual);
+  pintar();
+  aviso('Análise concluída');
+}
+function carregarFicheiroContrato(input){
+  const f = input.files[0]; if (!f) return;
+  const r = new FileReader();
+  r.onload = () => {
+    textoContratoAtual = String(r.result);
+    if (!nomeContratoAtual) nomeContratoAtual = f.name.replace(/\.[^.]+$/,'');
+    pintar(); aviso('Ficheiro carregado — reveja o texto e analise');
+  };
+  r.readAsText(f); input.value = '';
+}
+function guardarAnaliseAtual(){
+  if (!analiseAtual) return;
+  S.contratos.push({ id:uid(), nome:nomeContratoAtual || 'Sem nome', texto:textoContratoAtual, data:analiseAtual.data, pontuacao:analiseAtual.pontuacao, nivel:analiseAtual.nivel, achados:analiseAtual.achados });
+  guardar(); pintar(); aviso('Análise guardada');
+}
+function verContratoGuardado(id){
+  const c = S.contratos.find(x => x.id === id); if (!c) return;
+  nomeContratoAtual = c.nome; textoContratoAtual = c.texto;
+  analiseAtual = analisarTexto(c.texto);
+  pintar(); window.scrollTo({top:0,behavior:'smooth'});
+}
+function apagarContratoGuardado(id){
+  const c = S.contratos.find(x => x.id === id); if (!c) return;
+  if (!confirm(`Apagar a análise de "${c.nome}"?`)) return;
+  S.contratos = S.contratos.filter(x => x.id !== id); guardar(); pintar(); aviso('Análise apagada');
 }
 
 /* ======================= formulários ======================= */
@@ -1068,15 +1356,15 @@ function importar(input){
     try {
       const d = JSON.parse(r.result);
       if (!d.transacoes) throw new Error('formato');
-      S = Object.assign({ transacoes:[], orcamentos:{}, dividas:[], objetivos:[], config:{saldoInicial:0} }, d);
+      S = Object.assign({ transacoes:[], orcamentos:{}, dividas:[], objetivos:[], contratos:[], config:{saldoInicial:0} }, d);
       guardar(); pintar(); aviso('Dados importados');
     } catch(e) { aviso('Ficheiro inválido — esperava-se uma cópia exportada daqui'); }
   };
   r.readAsText(f); input.value = '';
 }
 function apagarTudo(){
-  if (!confirm('Apagar todos os movimentos, orçamentos, dívidas e objetivos?')) return;
-  S = { transacoes:[], orcamentos:{}, dividas:[], objetivos:[], config:{saldoInicial:0} };
+  if (!confirm('Apagar todos os movimentos, orçamentos, dívidas, objetivos e análises de contratos guardadas?')) return;
+  S = { transacoes:[], orcamentos:{}, dividas:[], objetivos:[], contratos:[], config:{saldoInicial:0} };
   guardar(); pintar(); aviso('Tudo apagado');
 }
 function exemplo(){
@@ -1114,7 +1402,7 @@ const absAleat = (base,var_) => Math.round(base + (Math.random()*2-1)*var_);
 /* ======================= navegação ======================= */
 const VISTAS = [
   ['resumo','Resumo'], ['movimentos','Movimentos'], ['orcamentos','Orçamentos'],
-  ['dividas','Dívidas'], ['objetivos','Objetivos'], ['definicoes','Definições']
+  ['dividas','Dívidas'], ['objetivos','Objetivos'], ['contratos','Contratos'], ['definicoes','Definições']
 ];
 function irPara(v){ vista = v; pintar(); window.scrollTo({top:0,behavior:'smooth'}); }
 
@@ -1127,7 +1415,7 @@ function pintar(){
   const el = document.getElementById('saldo-global');
   el.textContent = eur(sg); el.className = 'num ' + (sg >= 0 ? 'pos' : 'neg');
   ({ resumo:pintarResumo, movimentos:pintarMovimentos, orcamentos:pintarOrcamentos,
-     dividas:pintarDividas, objetivos:pintarObjetivos, definicoes:pintarDefinicoes })[vista]();
+     dividas:pintarDividas, objetivos:pintarObjetivos, contratos:pintarContratos, definicoes:pintarDefinicoes })[vista]();
 }
 
 function localStorageSeguro(k){ try { return localStorage.getItem('livro-contas:' + k); } catch(e){ return null; } }
